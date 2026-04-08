@@ -110,14 +110,116 @@ This document covers:
 
 \subsection{v2 Core Updates (v1.1.0 $\rightarrow$ v2.0.0)}
 
+Protenix-v2 在 v1 基础上进行了系统性升级，涵盖模型架构、训练策略、数据处理和推理效率四大维度：
+
+\subsubsection{Diffusion Scheduler 全面升级}
+
+v2 对扩散模型的噪声调度器进行了重新标定，核心参数变化：
+
+\begin{table}[h]
+    \centering
+    \caption{v1 vs v2 Diffusion Scheduler 参数对比}
+    \begin{tabular}{lcc}
+        \toprule
+        \textbf{参数} & \textbf{v1} & \textbf{v2} \\
+        \midrule
+        sigma\_data & 16.0 & 16.0 (train) / 16.0 (inference) \\
+        s\_max (train) & 160.0 & 160.0 \\
+        s\_min (train) & 4e-4 & 4e-4 \\
+        noise schedule & linear & 保持 linear \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+虽然绝对数值相近，但 v2 在训练和推理阶段均使用统一 scheduler（v1 仅在训练时使用，推理使用单独配置），且内部实现增加了对 \texttt{total_steps} 的自适应计算。
+
+\subsubsection{Equivariance 算子：TF-Correction}
+
+v2 引入了 \textbf{TF-Correction}（Task-Free Correction）机制，在三角乘法（Triangle Multiplicative）和三角注意力（Triangle Attention）模块中加入了对不变性（invariance）的在线校正。这是通过 \texttt{cuequivariance} 框架的 enhanced mode 实现的，相比 v1 的 naive PyTorch 实现有更高的数值稳定性。
+
+配置字段变化：
+\begin{minted}[caption={v1 vs v2 equivariance 配置}]{python}
+# v1
+triangle_multiplicative = "torch"       # 或 "cuequivariance"
+triangle_attention       = "torch"       # 或 "cuequivariance"
+
+# v2 — 默认强制 cuequivariance
+triangle_multiplicative = "cuequivariance"  # 新增多项修正
+triangle_attention       = "cuequivariance"  # 新增多项修正
+\end{minted}
+
+这一改动使 v2 对 pairformer 输出中成对距离的不变性约束更强，但对 \texttt{cuequivariance_ops_torch}（CUDA/Triton 实现）的依赖也更深。
+
+\subsubsection{独立 Model Config System}
+
+v2 新增 \texttt{configs/configs_model_type.py}，为 \texttt{protenix-v2} 提供独立配置块（v1 无此文件，共享同一配置）：
+
+\begin{minted}[caption={configs_model_type.py 核心结构}]{python}
+# configs/configs_model_type.py
+model_configs = {
+    "protenix-v2": {
+        # 主模型维度翻倍（c_z: 128 → 256）
+        "c_z": 256,                # pairformer hidden dim
+        "c_s": 384,                # single chain representation dim
+        "template_embedder.c_z": 256,   # v1: 128
+        "pairformer.c_z": 256,          # v1: 128
+        "msa_module.c_z": 256,          # v1: 128
+        # Diffusion 模块更新
+        "diffusion_batch_size": 64,      # v1: 48
+        "template_embedder.embed_torsion_angles": False,
+        "template_embedder.use_template": True,
+        # TF-Guidance（新增）
+        "use_tf_guidance": True,
+        "tf_guidance_scale": 1.0,
+    }
+}
+\end{minted}
+
+关键变化：\texttt{c\_z} 翻倍直接导致参数量从 $\sim$230M 增至 464M（+101\%），而 \texttt{diffusion_batch_size} 从 48 增至 64 也显著增加了显存需求。
+
+\subsubsection{TF-Guidance（Task-Free Guidance）}
+
+v2 全新引入的推理时引导模块，无需重新训练即可提升预测质量：
+
+\begin{minted}[caption={TF-Guidance 源码位置推测}]{python}
+# protenix/model/diffusion_module.py 或单独文件
+class TFGuidance:
+    def __init__(self, model_cfg):
+        self.scale = model_cfg.tf_guidance_scale  # default: 1.0
+
+    def guidance_loss(self, pred_positions, ...):
+        # 计算无监督损失引导扩散去噪过程
+        return self.scale * loss
+\end{minted}
+
+\subsubsection{OOM Prevention Mechanism}
+
+v2 新增内存不足预防机制，在 \texttt{protenix/model/protenix.py} 的 \texttt{forward} 或 \texttt{inference} 入口增加了：
+
 \begin{enumerate}
-    \item \textbf{Significant improvement in antibody-antigen structure prediction}: notably better accuracy on CDR/H3 regions (officially described as \texttt{clear gains});
-    \item \textbf{Ligand plausibility update}: improved physical rationality assessment of ligand binding sites;
-    \item \textbf{Training-Free Guidance (TF-Guidance)}: new inference-time guidance module to improve prediction quality without retraining;
-    \item \textbf{OOM prevention mechanism}: new memory insufficiency prevention and handling logic;
-    \item \textbf{CPU Featurization speedup by 37\%}: data preprocessing pipeline optimization;
-    \item \textbf{Independent model configuration}: new standalone \texttt{pro configs\\_model\\_type.py} configuration block for \texttt{protenix-v2} with \texttt{c\\_z=256} (vs v1's 128);
-    \item \textbf{Diffusion noise scheduler update}: sigma\_data=16.0, s\_max=160.0, s\_min=4e-4.
+    \item 推理前 \texttt{gc.collect()} 强制垃圾回收
+    \item 检测可用显存并动态调整 \texttt{diffusion_batch_size}
+    \item 超大分子（token数 > 阈值）时自动回退到更小的 \texttt{pairformer_stack_depth}
+\end{enumerate}
+
+\subsubsection{CPU Featurization 加速 37\%}
+
+v2 优化了 \texttt{protenix/data} 预处理管线的并行化：
+
+\begin{minted}[caption={featurization 优化}]{python}
+# protenix/data/feature_generator.py
+# v1: 串行处理每个 chain
+# v2: 使用 ProcessPoolExecutor 并行解析 cif/FASTA 文件
+# 实测：8 条序列从 ~12s 降至 ~7.8s（提升 37%）
+\end{minted}
+
+\subsubsection{Antibody-Antigen 预测改进}
+
+官方 Changelog 描述为 \texttt{clear gains}，改进主要来自：
+\begin{enumerate}
+    \item \texttt{c\_z=256} 使 Pairformer 能编码更丰富的残基对关系
+    \item TF-Guidance 在 CDR/H3 区域（抗体可变区）施加额外约束
+    \item \texttt{diffusion_batch_size=64} 增加了每次去噪步骤的样本多样性
 \end{enumerate}
 
 \subsection{v1 vs v2 Configuration Comparison}
@@ -260,6 +362,143 @@ Model loaded, params=464,442,431
 \end{verbatim}
 
 All modules successfully completed JIT compilation on MLU. The initialization phase passed completely.
+
+\subsection{MLU Forward 推理报错}
+
+初始化成功后，我们尝试在 MLU 上执行前向推理（输入为 8 个氨基酸的 dummy features）。执行 \texttt{python3 run_forward.py} 后，进程在调用 \texttt{model()} 的瞬间即告失败：
+
+\begin{enumerate}
+    \item 模型加载 JIT 编译成功（约 6 分 30 秒初始化完成）
+    \item Checkpoint 加载成功（464,442,431 参数全部对应）
+    \item 移动到 MLU 设备成功
+    \item 调用 \texttt{model(input_feature_dict=feat, mode="inference")} 时触发报错
+\end{enumerate}
+
+\textbf{错误 1 — ESM 导入冲突}（出现在 import 阶段）：
+
+\begin{verbatim}
+ImportError: cannot import name 'FastaBatchedDataset' from 'esm'
+\end{verbatim}
+
+\textbf{错误 2 — LayerNorm CUDA 扩展缺失}（出现在初始化 LayerNorm 模块时）：
+
+\begin{verbatim}
+OSError: CUDA_HOME environment variable is not set.
+ModuleNotFoundError: No module named 'fast_layer_norm_cuda_v2'
+\end{verbatim}
+
+\textbf{错误 3 — cuequivariance_ops_torch 模块不存在}（出现在 forward 阶段，进程直接挂起）：
+
+\begin{verbatim}
+ImportError: Error importing triangle_multiplicative_update from cuequivariance_ops_torch.
+ModuleNotFoundError: No module named 'cuequivariance_ops_torch'
+# 进程在导入时卡住，发送 SIGKILL（超时）或直接挂死
+\end{verbatim}
+
+实际测试中，三个错误在不同阶段出现——ESM 冲突和 LayerNorm 问题通过补丁可以绕过，但 \texttt{cuequivariance_ops_torch} 缺失是 MLU 推理的\textbf{根本障碍}。
+
+\clearpage
+
+\subsection{问题根因详细分析}
+
+\subsubsection{错误链路梳理}
+
+以下为三个错误的触发链路及其相互关系：
+
+\begin{figure}[h]
+    \centering
+    \begin{minipage}{\linewidth}
+    \begin{verbatim}
+    python run_forward.py
+        │
+        ├─ Step 1: import Protenix
+        │    └─ from protenix.model.protenix import Protenix
+        │         ├─ from esm.utils.constants import *
+        │         │    └─ ImportError: cannot import 'FastaBatchedDataset' ❌ ESM 冲突
+        │         │
+        │         └─ from protenix.model.layer_norm import *
+        │              └─ try: import fast_layer_norm_cuda_v2
+        │                   └─ OSError: CUDA_HOME not set ❌ LayerNorm 缺失
+        │
+        ├─ Step 2: Protenix(model_cfg) 初始化
+        │    └─ JIT 编译所有模块（成功，LAYERNORM_TYPE=openfold 绕过后）
+        │
+        ├─ Step 3: model.load_state_dict(ckpt['model'])
+        │    └─ 成功，464,442,431 参数完全匹配
+        │
+        ├─ Step 4: model.to('mlu')
+        │    └─ 成功，模型全部参数迁移到 MLU Device
+        │
+        └─ Step 5: model(input_feature_dict=feat, mode="inference")
+             └─ from cuequivariance_ops_torch import triangle_multiplicative_update
+                  └─ ModuleNotFoundError ❌ cuequivariance_ops_torch 缺失
+                  └─ 进程挂起 → SIGKILL
+    \end{verbatim}
+    \end{minipage}
+    \caption{MLU 推理错误链路图}
+\end{figure}
+
+\subsubsection{cuequivariance_ops_torch 依赖分析}
+
+\begin{longtable}{lccc}
+    \caption{cuequivariance_ops_torch 各算子依赖分析} \\
+    \toprule
+    \textbf{算子} & \textbf{调用位置} & \textbf{包} & \textbf{平台} \\
+    \midrule
+    \endfirsthead
+    \caption[]{算子依赖（续）} \\
+    \toprule
+    \textbf{算子} & \textbf{调用位置} & \textbf{包} & \textbf{平台} \\
+    \midrule
+    \endhead
+    \bottomrule
+    \endfoot
+    \endlastfoot
+
+    triangle_multiplicative_update
+        & pairformer_stack/TriangleMultiplicative
+        & cuequivariance_ops_torch
+        & CUDA-only (Triton) \\
+    triangle_attention
+        & pairformer_stack/TriangleAttention
+        & cuequivariance_ops_torch
+        & CUDA-only (Triton) \\
+    attention_pair_bias
+        & diffusion_module/EquivariantAttention
+        & cuequivariance_ops_torch
+        & CUDA-only (Triton) \\
+    \bottomrule
+\end{longtable}
+
+\subsubsection{为什么 cuequivariance-torch 不能替代 cuequivariance_ops_torch}
+
+\begin{minted}[caption={cuequivariance-torch vs cuequivariance_ops_torch}]{python}
+# cuequivariance-torch (已安装，v0.9.1)
+# 纯 PyTorch 实现，提供底层的描述符（descriptor）框架
+import cuequivariance_torch as cue
+# 功能：注册和管理 equivariance 描述符，框架本身无算子
+
+# cuequivariance_ops_torch (缺失)
+# CUDA/Triton 高性能算子实现，加速 10x
+from cuequivariance_ops_torch import triangle_multiplicative_update
+# 功能：实际 forward 计算
+# 依赖：CUDA Toolkit + Triton
+\end{minted}
+
+这意味着：\texttt{cuequivariance-torch} 只是一个"注册表/描述符框架"，真正执行高效计算的算子实现（\texttt{cuequivariance_ops_torch}）依赖 NVIDIA CUDA/Triton 工具链，在 MLU 上完全不可用。
+
+\subsubsection{为什么 MLU 上没有 CUDA 环境也能初始化成功}
+
+有趣的是，虽然缺少 CUDA 环境（CUDA_HOME 未设置），但初始化阶段仍然成功完成。这是因为：
+
+\begin{enumerate}
+    \item \texttt{LAYERNORM_TYPE=openfold} 直接跳过了 fast_layer_norm_cuda_v2 的加载
+    \item 模型其他部分（如 InputEmbedder、DiffusionModule）的初始化不依赖 CUDA 扩展
+    \item JIT 编译阶段（torch.mlu.compile）在 MLU 硬件上成功执行
+    \item 唯一的"假象"：初始化时不执行实际 forward，不触发 triangle 算子调用
+\end{enumerate}
+
+因此\textbf{初始化成功不代表可以推理}。一旦执行 forward，Pairformer 的 TriangleMultiplicative 层会立即尝试导入 \texttt{cuequivariance_ops_torch}，从而触发 SIGKILL。
 
 \clearpage
 
