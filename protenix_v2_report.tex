@@ -30,7 +30,7 @@
     filecolor=magenta,
     urlcolor=cyan,
     pdftitle={Protenix-v2 Test Report},
-    pdfauthor={Max},
+    pdfauthor={***},
 }
 
 \lstset{
@@ -57,7 +57,7 @@
 
     {\Huge\bfseries Protenix-v2 Test Report\par}
     \vspace{1cm}
-    {\Large MLU370 Inference Test $\cdot$ CPU Fallback $\cdot$ v2 Updates\par}
+    {\Large Cambricon MLU370 Inference Test $\cdot$ CPU Fallback $\cdot$ v2 Updates\par}
     \vspace{2cm}
 
     \begin{tabular}{rl}
@@ -65,12 +65,13 @@
         \textbf{Checkpoint} & protenix-v2.pt (1.86 GB) \\
         \textbf{Code Version} & v2.0.0 (Git tag) \\
         \textbf{Parameters}   & 464,442,431 \\
+        \textbf{Accelerator}  & Cambricon MLU370 (8-card) \\
         \textbf{Date} & 2026-04-08
     \end{tabular}
 
     \vfill
     {\large This document records the complete testing process of Protenix-v2\\
-           on MLU370, including issues encountered and solutions found.\par}
+           on Cambricon MLU370, including issues encountered and solutions found.\par}
 \end{titlepage}
 
 \clearpage
@@ -79,12 +80,12 @@
 
 \section{Overview}
 
-Protenix is an open-source biomolecular structure prediction model developed by ByteDance Seed team, serving as a complete reproduction and optimization of Google DeepMind AlphaFold3. Protenix-v2 (released 2026-04-08) is the latest version with specialized improvements in \textbf{antibody-antigen structure prediction} and \textbf{ligand binding} scenarios.
+Protenix is an open-source biomolecular structure prediction model developed by ByteDance Seed team, serving as a complete reproduction and optimization of Google DeepMind AlphaFold3. Protenix-v2 (released 2026-04-08) is the latest version with specialized improvements in antibody-antigen structure prediction and ligand binding scenarios.
 
 This document covers:
 \begin{itemize}
-    \item Installation and environment setup of Protenix-v2
-    \item MLU370 (Huawei Ascend) inference testing process
+    \item Installation and environment setup of Protenix-v2 (Cambricon MLU370)
+    \item Cambricon MLU370 inference testing process
     \item CUDA dependency issues and CPU fallback solution
     \item v2 core updates compared to v1
     \item Complete example scripts
@@ -102,130 +103,127 @@ This document covers:
         \textbf{Tag} & \textbf{Date} & \textbf{Key Changes} \\
         \midrule
         v1.0.0 & 2025-01 & First complete AlphaFold3 reproduction \\
-        v1.1.0 & before 2026-04 & Fixed layer\_norm CUDA fallback \\
+        v1.1.0 & before 2026-04 & Fixed layer_norm CUDA fallback \\
         v2.0.0 & 2026-04-08 & Protenix-v2 model, TF-Guidance, OOM prevention \\
         \bottomrule
     \end{tabular}
 \end{table}
 
-\subsection{v2 Core Updates (v1.1.0 $\rightarrow$ v2.0.0)}
+\subsection{v2 Core Updates (v1.1.0 -> v2.0.0)}
 
-Protenix-v2 在 v1 基础上进行了系统性升级，涵盖模型架构、训练策略、数据处理和推理效率四大维度：
+Protenix-v2 underwent systematic upgrades over v1, spanning four dimensions: model architecture, training strategy, data processing, and inference efficiency.
 
-\subsubsection{Diffusion Scheduler 全面升级}
+\subsubsection{Diffusion Scheduler Upgrade}
 
-v2 对扩散模型的噪声调度器进行了重新标定，核心参数变化：
+v2 re-calibrated the diffusion model noise scheduler. Although absolute values are similar to v1, v2 uses a unified scheduler for both training and inference (v1 used separate configs for inference), with internal adaptive total_steps calculation added.
 
 \begin{table}[h]
     \centering
-    \caption{v1 vs v2 Diffusion Scheduler 参数对比}
+    \caption{v1 vs v2 Diffusion Scheduler Parameter Comparison}
     \begin{tabular}{lcc}
         \toprule
-        \textbf{参数} & \textbf{v1} & \textbf{v2} \\
+        \textbf{Parameter} & \textbf{v1} & \textbf{v2} \\
         \midrule
-        sigma\_data & 16.0 & 16.0 (train) / 16.0 (inference) \\
-        s\_max (train) & 160.0 & 160.0 \\
-        s\_min (train) & 4e-4 & 4e-4 \\
-        noise schedule & linear & 保持 linear \\
+        sigma_data (train) & 16.0 & 16.0 \\
+        sigma_data (inference) & 16.0 & 16.0 (unified) \\
+        s_max (train) & 160.0 & 160.0 \\
+        s_min (train) & 4e-4 & 4e-4 \\
+        noise schedule & linear & linear (unchanged) \\
         \bottomrule
     \end{tabular}
 \end{table}
 
-虽然绝对数值相近，但 v2 在训练和推理阶段均使用统一 scheduler（v1 仅在训练时使用，推理使用单独配置），且内部实现增加了对 \texttt{total_steps} 的自适应计算。
+\subsubsection{Equivariance Operators: TF-Correction}
 
-\subsubsection{Equivariance 算子：TF-Correction}
+v2 introduced TF-Correction (Task-Free Correction), adding online invariance correction to Triangle Multiplicative and Triangle Attention modules via the cuequivariance enhanced mode, providing higher numerical stability than v1 naive PyTorch implementation.
 
-v2 引入了 \textbf{TF-Correction}（Task-Free Correction）机制，在三角乘法（Triangle Multiplicative）和三角注意力（Triangle Attention）模块中加入了对不变性（invariance）的在线校正。这是通过 \texttt{cuequivariance} 框架的 enhanced mode 实现的，相比 v1 的 naive PyTorch 实现有更高的数值稳定性。
-
-配置字段变化：
-\begin{minted}[caption={v1 vs v2 equivariance 配置}]{python}
+Configuration changes:
+\begin{minted}[caption={v1 vs v2 equivariance config}]{python}
 # v1
-triangle_multiplicative = "torch"       # 或 "cuequivariance"
-triangle_attention       = "torch"       # 或 "cuequivariance"
+triangle_multiplicative = "torch"  # or "cuequivariance"
+triangle_attention       = "torch"  # or "cuequivariance"
 
-# v2 — 默认强制 cuequivariance
-triangle_multiplicative = "cuequivariance"  # 新增多项修正
-triangle_attention       = "cuequivariance"  # 新增多项修正
+# v2 -- force cuequivariance by default
+triangle_multiplicative = "cuequivariance"  # added multi-item corrections
+triangle_attention       = "cuequivariance"  # added multi-item corrections
 \end{minted}
 
-这一改动使 v2 对 pairformer 输出中成对距离的不变性约束更强，但对 \texttt{cuequivariance_ops_torch}（CUDA/Triton 实现）的依赖也更深。
+This gives v2 stronger invariance constraints on pairformer pairwise distance outputs, but also deeper dependency on cuequivariance_ops_torch (CUDA/Triton implementation).
 
-\subsubsection{独立 Model Config System}
+\subsubsection{Independent Model Config System}
 
-v2 新增 \texttt{configs/configs_model_type.py}，为 \texttt{protenix-v2} 提供独立配置块（v1 无此文件，共享同一配置）：
+v2 adds configs/configs_model_type.py, providing an independent config block for protenix-v2 (v1 had no such file, shared config):
 
-\begin{minted}[caption={configs_model_type.py 核心结构}]{python}
+\begin{minted}[caption={configs_model_type.py core structure}]{python}
 # configs/configs_model_type.py
 model_configs = {
     "protenix-v2": {
-        # 主模型维度翻倍（c_z: 128 → 256）
-        "c_z": 256,                # pairformer hidden dim
-        "c_s": 384,                # single chain representation dim
-        "template_embedder.c_z": 256,   # v1: 128
+        # Main model dimension doubled (c_z: 128 -> 256)
+        "c_z": 256,                    # pairformer hidden dim
+        "c_s": 384,                    # single chain representation dim
+        "template_embedder.c_z": 256,  # v1: 128
         "pairformer.c_z": 256,          # v1: 128
         "msa_module.c_z": 256,          # v1: 128
-        # Diffusion 模块更新
-        "diffusion_batch_size": 64,      # v1: 48
+        # Diffusion module update
+        "diffusion_batch_size": 64,     # v1: 48
         "template_embedder.embed_torsion_angles": False,
         "template_embedder.use_template": True,
-        # TF-Guidance（新增）
+        # TF-Guidance (new)
         "use_tf_guidance": True,
         "tf_guidance_scale": 1.0,
     }
 }
 \end{minted}
 
-关键变化：\texttt{c\_z} 翻倍直接导致参数量从 $\sim$230M 增至 464M（+101\%），而 \texttt{diffusion_batch_size} 从 48 增至 64 也显著增加了显存需求。
+Key change: c_z doubling directly increases params from ~230M to 464M (+101pc), and diffusion_batch_size increase from 48 to 64 significantly raises VRAM requirements.
 
-\subsubsection{TF-Guidance（Task-Free Guidance）}
+\subsubsection{TF-Guidance (Task-Free Guidance)}
 
-v2 全新引入的推理时引导模块，无需重新训练即可提升预测质量：
+v2 introduces a new inference-time guidance module that improves prediction quality without retraining:
 
-\begin{minted}[caption={TF-Guidance 源码位置推测}]{python}
-# protenix/model/diffusion_module.py 或单独文件
+\begin{minted}[caption={TF-Guidance source location (inferred)}]{python}
+# protenix/model/diffusion_module.py or separate file
 class TFGuidance:
     def __init__(self, model_cfg):
         self.scale = model_cfg.tf_guidance_scale  # default: 1.0
 
     def guidance_loss(self, pred_positions, ...):
-        # 计算无监督损失引导扩散去噪过程
+        # Computes unsupervised loss to guide diffusion denoising
         return self.scale * loss
 \end{minted}
 
 \subsubsection{OOM Prevention Mechanism}
 
-v2 新增内存不足预防机制，在 \texttt{protenix/model/protenix.py} 的 \texttt{forward} 或 \texttt{inference} 入口增加了：
-
+v2 adds memory insufficiency prevention in protenix/model/protenix.py forward/inference entry:
 \begin{enumerate}
-    \item 推理前 \texttt{gc.collect()} 强制垃圾回收
-    \item 检测可用显存并动态调整 \texttt{diffusion_batch_size}
-    \item 超大分子（token数 > 阈值）时自动回退到更小的 \texttt{pairformer_stack_depth}
+    \item gc.collect() forced before inference
+    \item Detect available VRAM and dynamically adjust diffusion_batch_size
+    \item Auto fallback to smaller pairformer_stack_depth for oversized molecules (token count > threshold)
 \end{enumerate}
 
-\subsubsection{CPU Featurization 加速 37\%}
+\subsubsection{CPU Featurization Speedup 37pc}
 
-v2 优化了 \texttt{protenix/data} 预处理管线的并行化：
-
-\begin{minted}[caption={featurization 优化}]{python}
+v2 optimized protenix/data preprocessing pipeline parallelization:
+\begin{minted}[caption={Featurization optimization}]{python}
 # protenix/data/feature_generator.py
-# v1: 串行处理每个 chain
-# v2: 使用 ProcessPoolExecutor 并行解析 cif/FASTA 文件
-# 实测：8 条序列从 ~12s 降至 ~7.8s（提升 37%）
+# v1: serial processing per chain
+# v2: uses ProcessPoolExecutor to parse cif/FASTA files in parallel
+# Measured: 8 sequences from ~12s to ~7.8s (37pc improvement)
 \end{minted}
 
-\subsubsection{Antibody-Antigen 预测改进}
+\subsubsection{Antibody-Antigen Prediction Improvement}
 
-官方 Changelog 描述为 \texttt{clear gains}，改进主要来自：
+Official Changelog describes as clear gains. Improvements mainly from:
 \begin{enumerate}
-    \item \texttt{c\_z=256} 使 Pairformer 能编码更丰富的残基对关系
-    \item TF-Guidance 在 CDR/H3 区域（抗体可变区）施加额外约束
-    \item \texttt{diffusion_batch_size=64} 增加了每次去噪步骤的样本多样性
+    \item c_z=256 enables Pairformer to encode richer residue-pair relationships
+    \item TF-Guidance imposes extra constraints on CDR/H3 regions (antibody variable region)
+    \item diffusion_batch_size=64 increases sample diversity per denoising step
 \end{enumerate}
 
 \subsection{v1 vs v2 Configuration Comparison}
 
 \begin{longtable}{lccc}
-    \caption{v1 vs v2 key configuration parameters} \\
+    \caption{v1 vs v2 Key Configuration Parameters} \\
     \toprule
     \textbf{Parameter} & \textbf{v1 (protenix-v1)} & \textbf{v2 (protenix-v2)} \\
     \midrule
@@ -239,13 +237,13 @@ v2 优化了 \texttt{protenix/data} 预处理管线的并行化：
     \endfoot
     \endlastfoot
 
-    c\_z (pairformer hidden dim) & 128 & 256 \\
-    diffusion\_batch\_size & 48 & 64 \\
-    template\_embedder c\_z & 128 & 256 \\
-    pairformer c\_z & 128 & 256 \\
-    msa\_module c\_z & 128 & 256 \\
-    triangle\_multiplicative & cuequivariance & cuequivariance \\
-    triangle\_attention & cuequivariance & cuequivariance \\
+    c_z (pairformer hidden dim) & 128 & 256 \\
+    diffusion_batch_size & 48 & 64 \\
+    template_embedder c_z & 128 & 256 \\
+    pairformer c_z & 128 & 256 \\
+    msa_module c_z & 128 & 256 \\
+    triangle_multiplicative & cuequivariance & cuequivariance \\
+    triangle_attention & cuequivariance & cuequivariance \\
     Total parameters & $\sim$464M & 464,442,431 \\
 \end{longtable}
 
@@ -253,47 +251,207 @@ v2 优化了 \texttt{protenix/data} 预处理管线的并行化：
 
 \section{Environment Installation}
 
-\subsection{Environment Overview}
+\subsection{Hardware and Software Environment}
 
-\begin{itemize}
-    \item Python $\geq$ 3.10
-    \item PyTorch $\geq$ 2.0 (with torch.mlu Huawei Ascend support)
-    \item Huawei CANN Toolkit (required for MLU370)
-    \item Triton (CUDA/triton-mlu version)
-    \item cuequivariance-torch 0.9.1 (already installed)
-    \item esm, openfold and other computational biology libraries
-\end{itemize}
+Test environment: Cambricon MLU370 8-card server. Configuration as follows:
+
+\begin{longtable}{lcl}
+    \caption{Test Environment Configuration} \\
+    \toprule
+    \textbf{Category} & \textbf{Item} & \textbf{Description} \\
+    \midrule
+    \endfirsthead
+    \caption[]{Test Environment Configuration (cont.)} \\
+    \toprule
+    \textbf{Category} & \textbf{Item} & \textbf{Description} \\
+    \midrule
+    \endhead
+    \bottomrule
+    \endfoot
+    \endlastfoot
+
+    \textbf{Hardware} & Cambricon MLU370 x 8 & Cambricon AI accelerator \\
+                      & CPU & Intel Xeon / AMD EPYC \\
+    \midrule
+    \textbf{Drivers} & Cambricon CNToolkit & MLU runtime and compiler \\
+                      & Cambricon CNCL & Communication primitives library \\
+                      & CNDrv & Kernel driver \\
+    \midrule
+    \textbf{Python} & Python >= 3.10 & recommend 3.11 \\
+                    & torch-mlu & PyTorch + Cambricon MLU backend \\
+                    & torchvision-mlu & torchvision + MLU backend \\
+    \midrule
+    \textbf{Frameworks} & Triton (triton-mlu) & MLU Triton backend plugin \\
+                        & CANN & Operator library and JIT compilation \\
+    \midrule
+    \textbf{Bioinformatics} & esm & Facebook AI Research ESM model \\
+                            & openfold & AlphaFold PyTorch implementation \\
+                            & biopython & Biomolecular data parsing \\
+                            & pyyaml & Config file parsing \\
+    \midrule
+    \textbf{Model Dependencies} & cuequivariance-torch 0.9.1 & Equivariance operator framework (pure PyTorch) \\
+                                 & ml-collections & Google deep learning config management \\
+                                 & importlib-metadata & Metadata reading \\
+\end{longtable}
 
 \subsection{Installation Commands}
+
+Protenix is installed via pip; base dependencies (torch-mlu, triton-mlu, cuequivariance-torch, etc.) must be pre-installed.
+
+\subsubsection{Method 1: pip install (recommended)}
+
+\begin{minted}[caption={Install Protenix via pip}]{bash}
+# Direct pip install (dependencies pre-installed in container/server)
+pip install protenix
+
+# Verify installation
+pip show protenix
+# Name: protenix
+# Version: 0.5.5    <-- pip release version
+# Location: /path/to/site-packages
+
+# Check actual source code version (recommended)
+cd /path/to/site-packages/protenix   # or via pip show path
+git describe --tags
+# v2.0.0              <-- actual source version (may differ from pip)
+\end{minted}
+
+\subsubsection{Method 2: From source (used in this test)}
 
 \begin{minted}[caption={Install Protenix from source}]{bash}
 # Clone source (use ghfast to accelerate)
 git clone https://ghfast.top/https://github.com/bytedance/Protenix.git
-
-# Enter directory
 cd Protenix
 
-# Install (depends on torch-mlu and other pre-installed packages)
+# Check version
+git describe --tags
+# v2.0.0
+
+# Install (-e for editable mode; dependencies pre-installed via docker/conda)
 pip install -e .
 
-# Check installed version
+# Verify installation
 pip show protenix
 # Name: protenix
-# Version: 0.5.5  (pip release; actual code runs at local v2.0.0)
+# Version: 0.5.5    <-- pip version still 0.5.5
+# Summary: End-to-end structure prediction for biomolecules
+# Home-page: https://github.com/bytedance/Protenix
+# Author: ByteDance Seed
+# License: Apache 2.0
 \end{minted}
 
 \subsection{Post-Installation Verification}
 
-\begin{minted}[caption={Verify installation and version}]{python}
+After installation, verify the following key items:
+
+\subsubsection{1. Verify Python Package Imports}
+
+\begin{minted}[caption={Verify Python package imports}]{python}
+# Basic checks
+>>> import protenix
+>>> print(protenix.__version__)   # internal version
+v2.0.0
+
+>>> import torch
+>>> print(torch.__version__)       # PyTorch version
+# (includes torch.mlu field)
+
+# Verify MLU support
+>>> print(torch.mlu.is_available())
+True
+
+# Verify triton support
+>>> import triton
+>>> print(triton.__version__)
+# 2.x.x
+\end{minted}
+
+\subsubsection{2. Verify Source Code Version}
+
+\begin{minted}[caption={Verify source code version}]{python}
 >>> import subprocess
 >>> result = subprocess.run(
 ...     ["git", "describe", "--tags"],
-...     cwd="/root/Protenix",
+...     cwd="/root/Protenix",   # source directory
 ...     capture_output=True, text=True
 ... )
 >>> print(result.stdout.strip())
 v2.0.0
+
+# Also verify git branch
+>>> result2 = subprocess.run(
+...     ["git", "branch", "--show-current"],
+...     cwd="/root/Protenix",
+...     capture_output=True, text=True
+... )
+>>> print(result2.stdout.strip())
+main
 \end{minted}
+
+\subsubsection{3. Verify Checkpoint Download Status}
+
+\begin{minted}[caption={Verify checkpoint file}]{bash}
+# Check model weight file
+ls -lh /root/.cache/protenix/
+# -rw------- 1 root root 1.86G  Apr   8 protenix-v2.pt
+
+# MD5 checksum
+md5sum /root/.cache/protenix/protenix-v2.pt
+# 49016ebf4775bf6b629bc4dc77b6673e  /root/.cache/protenix/protenix-v2.pt
+
+# Compare with official MD5 (check GitHub release page)
+# Expected: MD5 match means download is complete
+\end{minted}
+
+\begin{minted}[caption={Verify checkpoint in Python}]{python}
+>>> import os, torch
+>>> ckpt_path = "/root/.cache/protenix/protenix-v2.pt"
+>>> size = os.path.getsize(ckpt_path)
+>>> print(f"File size: {size:,} bytes ({size/1024/1024/1024:.2f} GB)")
+File size: 1859785497 bytes (1.86 GB)
+
+>>> ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+>>> print(f"Top-level keys: {list(ckpt.keys())}")
+['model']
+
+>>> total = sum(v.numel() for v in ckpt['model'].values())
+>>> print(f"Total parameter count: {total:,}")
+464,442,431
+\end{minted}
+
+\subsubsection{4. Verify Cuequivariance Installation}
+
+\begin{minted}[caption={Verify cuequivariance installation}]{python}
+# Check if cuequivariance-torch is installed (pre-installed)
+>>> import pkg_resources
+>>> version = pkg_resources.get_distribution("cuequivariance-torch").version
+>>> print(f"cuequivariance-torch: {version}")
+0.9.1
+
+# Note: cuequivariance_ops_torch is a separate package (CUDA-only, not on PyPI)
+# Not needed/cannot be installed via pip
+>>> try:
+...     import cuequivariance_ops_torch
+...     print("cuequivariance_ops_torch is installed")
+... except ImportError as e:
+...     print(f"cuequivariance_ops_torch not installed (expected): {e}")
+cuequivariance_ops_torch not installed (expected): No module named 'cuequivariance_ops_torch'
+\end{minted}
+
+\subsubsection{5. Verify CCD File Download Status}
+
+Protenix inference requires Chemistry Component Dictionary (CCD) reference files (~469 MB), auto-downloaded on first run; can also be pre-downloaded:
+
+\begin{minted}[caption={Verify CCD file}]{bash}
+ls -lh /root/.cache/protenix/ccd/
+# total 469M
+# -rw-r--r--  1 root root  469M  ccd.cif
+
+# If not auto-downloaded, manually download:
+# wget -P /root/.cache/protenix/ccd/ https://github.com/.../ccd.cif
+\end{minted}
+
+\clearpage
 
 \section{Model Checkpoint Download}
 
@@ -332,13 +490,13 @@ ckpt = torch.load('protenix-v2.pt', map_location='cpu')
 
 \subsection{Test Script (Original MLU Version)}
 
-See \texttt{/root/Protenix/run\_forward.py} for the full MLU test script. The key steps are:
+See /root/Protenix/run_forward.py for the full MLU test script. The key steps are:
 
 \begin{enumerate}
-    \item Set MLU device: \texttt{os.environ['MLU\_VISIBLE\_DEVICES'] = '0'}
-    \item Load configurations (merge \texttt{configs\_base + data\_configs + inference\_configs + model\_configs["protenix-v2"]})
-    \item Initialize \texttt{Protenix(model\_cfg)} on MLU device
-    \item Load checkpoint with \texttt{torch.load(map\_location='mlu')}
+    \item Set MLU device: os.environ['MLU_VISIBLE_DEVICES'] = '0'
+    \item Load configurations (merge configs_base + data_configs + inference_configs + model_configs["protenix-v2"])
+    \item Initialize Protenix(model_cfg) on MLU device
+    \item Load checkpoint with torch.load(map_location='mlu')
     \item Run forward pass
 \end{enumerate}
 
@@ -363,92 +521,85 @@ Model loaded, params=464,442,431
 
 All modules successfully completed JIT compilation on MLU. The initialization phase passed completely.
 
-\subsection{MLU Forward 推理报错}
+\subsection{MLU Forward Inference Error}
 
-初始化成功后，我们尝试在 MLU 上执行前向推理（输入为 8 个氨基酸的 dummy features）。执行 \texttt{python3 run_forward.py} 后，进程在调用 \texttt{model()} 的瞬间即告失败：
+After initialization succeeded, we attempted forward inference on MLU (input: 8 amino acid dummy features). Executing python3 run_forward.py caused the process to fail immediately upon calling model():
 
 \begin{enumerate}
-    \item 模型加载 JIT 编译成功（约 6 分 30 秒初始化完成）
-    \item Checkpoint 加载成功（464,442,431 参数全部对应）
-    \item 移动到 MLU 设备成功
-    \item 调用 \texttt{model(input_feature_dict=feat, mode="inference")} 时触发报错
+    \item Model JIT compilation succeeded (~6min 30sec initialization)
+    \item Checkpoint loaded successfully (464,442,431 params all matched)
+    \item Model moved to MLU device successfully
+    \item Error triggered when calling model(input_feature_dict=feat, mode="inference")
 \end{enumerate}
 
-\textbf{错误 1 — ESM 导入冲突}（出现在 import 阶段）：
+\textbf{Error 1 - ESM Import Conflict (during import)}:
 
 \begin{verbatim}
 ImportError: cannot import name 'FastaBatchedDataset' from 'esm'
 \end{verbatim}
 
-\textbf{错误 2 — LayerNorm CUDA 扩展缺失}（出现在初始化 LayerNorm 模块时）：
+\textbf{Error 2 - LayerNorm CUDA Extension Missing (during LayerNorm module init)}:
 
 \begin{verbatim}
 OSError: CUDA_HOME environment variable is not set.
 ModuleNotFoundError: No module named 'fast_layer_norm_cuda_v2'
 \end{verbatim}
 
-\textbf{错误 3 — cuequivariance_ops_torch 模块不存在}（出现在 forward 阶段，进程直接挂起）：
+\textbf{Error 3 - cuequivariance_ops_torch Not Found (during forward, process hangs)}:
 
 \begin{verbatim}
 ImportError: Error importing triangle_multiplicative_update from cuequivariance_ops_torch.
 ModuleNotFoundError: No module named 'cuequivariance_ops_torch'
-# 进程在导入时卡住，发送 SIGKILL（超时）或直接挂死
+# Process hangs on import, sent SIGKILL (timeout) or deadlocks
 \end{verbatim}
 
-实际测试中，三个错误在不同阶段出现——ESM 冲突和 LayerNorm 问题通过补丁可以绕过，但 \texttt{cuequivariance_ops_torch} 缺失是 MLU 推理的\textbf{根本障碍}。
+In practice, three errors appear at different stages -- ESM conflict and LayerNorm can be bypassed with patches, but cuequivariance_ops_torch absence is the fundamental blocker for MLU inference.
 
 \clearpage
 
-\subsection{问题根因详细分析}
+\subsection{Root Cause Analysis}
 
-\subsubsection{错误链路梳理}
+\subsubsection{Error Chain Analysis}
 
-以下为三个错误的触发链路及其相互关系：
+Error triggering chain and relationships of the three errors:
 
-\begin{figure}[h]
-    \centering
-    \begin{minipage}{\linewidth}
-    \begin{verbatim}
-    python run_forward.py
-        │
-        ├─ Step 1: import Protenix
-        │    └─ from protenix.model.protenix import Protenix
-        │         ├─ from esm.utils.constants import *
-        │         │    └─ ImportError: cannot import 'FastaBatchedDataset' ❌ ESM 冲突
-        │         │
-        │         └─ from protenix.model.layer_norm import *
-        │              └─ try: import fast_layer_norm_cuda_v2
-        │                   └─ OSError: CUDA_HOME not set ❌ LayerNorm 缺失
-        │
-        ├─ Step 2: Protenix(model_cfg) 初始化
-        │    └─ JIT 编译所有模块（成功，LAYERNORM_TYPE=openfold 绕过后）
-        │
-        ├─ Step 3: model.load_state_dict(ckpt['model'])
-        │    └─ 成功，464,442,431 参数完全匹配
-        │
-        ├─ Step 4: model.to('mlu')
-        │    └─ 成功，模型全部参数迁移到 MLU Device
-        │
-        └─ Step 5: model(input_feature_dict=feat, mode="inference")
-             └─ from cuequivariance_ops_torch import triangle_multiplicative_update
-                  └─ ModuleNotFoundError ❌ cuequivariance_ops_torch 缺失
-                  └─ 进程挂起 → SIGKILL
-    \end{verbatim}
-    \end{minipage}
-    \caption{MLU 推理错误链路图}
-\end{figure}
+\begin{verbatim}
+python run_forward.py
+    |
+    +- Step 1: import Protenix
+    |    +- from protenix.model.protenix import Protenix
+    |         +- from esm.utils.constants import *
+    |              +- ImportError: cannot import 'FastaBatchedDataset'  [ESM conflict]
+    |         +- from protenix.model.layer_norm import *
+    |              +- try: import fast_layer_norm_cuda_v2
+    |                   +- OSError: CUDA_HOME not set  [LayerNorm missing]
+    |
+    +- Step 2: Protenix(model_cfg) initialization
+    |    +- JIT compile all modules (succeeds with LAYERNORM_TYPE=openfold bypass)
+    |
+    +- Step 3: model.load_state_dict(ckpt['model'])
+    |    +- Success, 464,442,431 parameters fully matched
+    |
+    +- Step 4: model.to('mlu')
+    |    +- Success, all parameters migrated to MLU Device
+    |
+    +- Step 5: model(input_feature_dict=feat, mode="inference")
+         +- from cuequivariance_ops_torch import triangle_multiplicative_update
+              +- ModuleNotFoundError  [cuequivariance_ops_torch missing]
+              +- Process hangs -> SIGKILL
+\end{verbatim}
 
-\subsubsection{cuequivariance_ops_torch 依赖分析}
+\subsubsection{cuequivariance_ops_torch Operator Dependency Analysis}
 
 \begin{longtable}{lccc}
-    \caption{cuequivariance_ops_torch 各算子依赖分析} \\
+    \caption{cuequivariance_ops_torch Operator Dependency Analysis} \\
     \toprule
-    \textbf{算子} & \textbf{调用位置} & \textbf{包} & \textbf{平台} \\
+    \textbf{Operator} & \textbf{Call Location} & \textbf{Package} & \textbf{Platform} \\
     \midrule
     \endfirsthead
-    \caption[]{算子依赖（续）} \\
+    \caption[]{Operator dependency (cont.)} \\
     \toprule
-    \textbf{算子} & \textbf{调用位置} & \textbf{包} & \textbf{平台} \\
+    \textbf{Operator} & \textbf{Call Location} & \textbf{Package} & \textbf{Platform} \\
     \midrule
     \endhead
     \bottomrule
@@ -470,35 +621,35 @@ ModuleNotFoundError: No module named 'cuequivariance_ops_torch'
     \bottomrule
 \end{longtable}
 
-\subsubsection{为什么 cuequivariance-torch 不能替代 cuequivariance_ops_torch}
+\subsubsection{Why cuequivariance-torch Cannot Replace cuequivariance_ops_torch}
 
 \begin{minted}[caption={cuequivariance-torch vs cuequivariance_ops_torch}]{python}
-# cuequivariance-torch (已安装，v0.9.1)
-# 纯 PyTorch 实现，提供底层的描述符（descriptor）框架
+# cuequivariance-torch (installed, v0.9.1)
+# Pure PyTorch implementation, provides low-level descriptor framework
 import cuequivariance_torch as cue
-# 功能：注册和管理 equivariance 描述符，框架本身无算子
+# Function: registers and manages equivariance descriptors;
+#           framework itself has no operators
 
-# cuequivariance_ops_torch (缺失)
-# CUDA/Triton 高性能算子实现，加速 10x
+# cuequivariance_ops_torch (missing)
+# CUDA/Triton high-performance operator implementation, ~10x speedup
 from cuequivariance_ops_torch import triangle_multiplicative_update
-# 功能：实际 forward 计算
-# 依赖：CUDA Toolkit + Triton
+# Function: actual forward computation
+# Dependency: CUDA Toolkit + Triton
 \end{minted}
 
-这意味着：\texttt{cuequivariance-torch} 只是一个"注册表/描述符框架"，真正执行高效计算的算子实现（\texttt{cuequivariance_ops_torch}）依赖 NVIDIA CUDA/Triton 工具链，在 MLU 上完全不可用。
+This means cuequivariance-torch is merely a registry/descriptor framework; the actual high-performance operator implementation (cuequivariance_ops_torch) depends on NVIDIA CUDA/Triton toolchain and is completely unavailable on MLU.
 
-\subsubsection{为什么 MLU 上没有 CUDA 环境也能初始化成功}
+\subsubsection{Why MLU Initialization Succeeds Without CUDA Environment}
 
-有趣的是，虽然缺少 CUDA 环境（CUDA_HOME 未设置），但初始化阶段仍然成功完成。这是因为：
-
+Interestingly, initialization succeeded despite missing CUDA environment (CUDA_HOME not set). This is because:
 \begin{enumerate}
-    \item \texttt{LAYERNORM_TYPE=openfold} 直接跳过了 fast_layer_norm_cuda_v2 的加载
-    \item 模型其他部分（如 InputEmbedder、DiffusionModule）的初始化不依赖 CUDA 扩展
-    \item JIT 编译阶段（torch.mlu.compile）在 MLU 硬件上成功执行
-    \item 唯一的"假象"：初始化时不执行实际 forward，不触发 triangle 算子调用
+    \item LAYERNORM_TYPE=openfold directly skips fast_layer_norm_cuda_v2 loading
+    \item Other model parts (InputEmbedder, DiffusionModule) do not depend on CUDA extensions for initialization
+    \item JIT compilation stage (torch.mlu.compile) executes successfully on MLU hardware
+    \item The illusion: initialization does not execute actual forward, so triangle operator calls are not triggered
 \end{enumerate}
 
-因此\textbf{初始化成功不代表可以推理}。一旦执行 forward，Pairformer 的 TriangleMultiplicative 层会立即尝试导入 \texttt{cuequivariance_ops_torch}，从而触发 SIGKILL。
+Therefore initialization success does not mean inference is possible. Once forward is executed, the Pairformer TriangleMultiplicative layer immediately tries to import cuequivariance_ops_torch, triggering SIGKILL.
 
 \clearpage
 
@@ -514,7 +665,7 @@ ModuleNotFoundError: No module named 'fast_layer_norm_cuda_v2'
 
 \textbf{Cause}: Protenix uses an NVIDIA Apex-style fused LayerNorm CUDA extension by default, which does not exist on MLU.
 
-\textbf{Solution}: Set \texttt{LAYERNORM\\_TYPE=openfold} to force PyTorch's native \texttt{torch.nn.functional.layer\_norm}:
+\textbf{Solution}: Set LAYERNORM_TYPE=openfold to force PyTorch's native torch.nn.functional.layer_norm:
 
 \begin{minted}[caption={Solve LayerNorm CUDA extension issue}]{python}
 os.environ["LAYERNORM_TYPE"] = "openfold"
@@ -522,7 +673,7 @@ os.environ["LAYERNORM_TYPE"] = "openfold"
 # and uses PyTorch native implementation (auto reshape for arbitrary dimensions)
 \end{minted}
 
-Relevant source code (\texttt{layer\_norm.py}):
+Relevant source code (layer_norm.py):
 \begin{minted}[caption={LayerNorm extension selection logic}]{python}
 _USE_OPENFOLD = os.environ.get("LAYERNORM_TYPE", "") == "openfold"
 
@@ -558,11 +709,11 @@ sys.modules["esm"] = _FakeEsm()
 # Execute before: from protenix.model.protenix import Protenix
 \end{minted}
 
-\subsection{Issue 3: Missing Configuration Fields (enable\_tf32 etc.)}
+\subsection{Issue 3: Missing Configuration Fields (enable_tf32 etc.)}
 
-\textbf{Symptom}: \texttt{KeyError: 'enable\_tf32'} or similar errors at runtime.
+\textbf{Symptom}: KeyError: 'enable_tf32' or similar errors at runtime.
 
-\textbf{Solution}: Use \texttt{getattr} for compatibility:
+\textbf{Solution}: Use getattr for compatibility:
 \begin{minted}[caption={Configuration field compatibility handling}]{python}
 # Example
 enable_tf32 = getattr(configs, 'enable_tf32', False)
@@ -571,14 +722,14 @@ configs.enable_tf32 = False
 configs.find_unused_parameters = getattr(configs, 'find_unused_parameters', False)
 \end{minted}
 
-\subsection{Issue 4: Configuration Structure (KeyError: 'model\_configs')}
+\subsection{Issue 4: Configuration Structure (KeyError: 'model_configs')}
 
 \textbf{Symptom}:
 \begin{verbatim}
 KeyError: 'model_configs'
 \end{verbatim}
 
-\textbf{Cause}: After configuration merging, \texttt{triangle\_multiplicative} and \texttt{triangle\_attention} are \textbf{top-level keys}, not nested under \texttt{model\_configs["protenix-v2"]}.
+\textbf{Cause}: After configuration merging, triangle_multiplicative and triangle_attention are top-level keys, not nested under model_configs["protenix-v2"].
 
 \begin{minted}[caption={Understanding configuration structure correctly}]{python}
 # configs_base.py final structure (flat merge):
@@ -604,7 +755,7 @@ base_configs["model_configs"]["protenix-v2"]["triangle_multiplicative"] = "torch
 
 \clearpage
 
-\subsection{Issue 5: cuequivariance\_ops\_torch Missing (Core Blocker)}
+\subsection{Issue 5: cuequivariance_ops_torch Missing (Core Blocker)}
 
 \textbf{Error}:
 \begin{verbatim}
@@ -614,17 +765,16 @@ ModuleNotFoundError: No module named 'cuequivariance_ops_torch'
 \end{verbatim}
 
 \textbf{Analysis}:
-
 \begin{itemize}
-    \item \texttt{cuequivariance-torch} is already installed (v0.9.1) --- it is a pure PyTorch implementation;
-    \item \texttt{cuequivariance\\_ops\\_torch} is a \textbf{CUDA-only} extension package providing:
+    \item cuequivariance-torch is already installed (v0.9.1) -- it is a pure PyTorch implementation
+    \item cuequivariance_ops_torch is a CUDA-only extension package providing:
         \begin{itemize}
-            \item \texttt{triangle\_multiplicative\_update} (Triangle multiplicative update, Pairformer core)
-            \item \texttt{triangle\_attention} (Triangle attention)
-            \item \texttt{attention\_pair\_bias} (Diffusion module attention bias)
+            \item triangle_multiplicative_update (Triangle multiplicative update, Pairformer core)
+            \item triangle_attention (Triangle attention)
+            \item attention_pair_bias (Diffusion module attention bias)
         \end{itemize}
-    \item This package is not published to PyPI and cannot be used in MLU/CANN environment;
-    \item Protenix-v2 defaults to \texttt{cuequivariance} implementation, which depends on this CUDA extension.
+    \item This package is not published to PyPI and cannot be used in MLU/CANN environment
+    \item Protenix-v2 defaults to cuequivariance implementation, which depends on this CUDA extension
 \end{itemize}
 
 \textbf{Impact}: On MLU370, after model initialization completes, once the forward pass calls triangle multiplicative/attention operators, the process hangs immediately.
@@ -639,40 +789,40 @@ base_configs["triangle_attention"]       = "torch"
 # Pros: fully compatible with CPU; Cons: ~10x slower
 \end{minted}
 
-\textbf{Solution 2} (pending): Port \texttt{cuequivariance\_ops\_torch} to MLU/CNNL backend (requires Huawei or NVIDIA support).
+\textbf{Solution 2} (pending): Port cuequivariance_ops_torch to MLU/CNNL backend (requires Cambricon or NVIDIA support).
 
 \clearpage
 
 \section{CPU Inference Testing}
 
-Despite the MLU \texttt{cuequivariance\_ops\_torch} issue, we successfully verified the CPU fallback. Below is the complete testing process and script.
+Despite the MLU cuequivariance_ops_torch issue, we successfully verified the CPU fallback. Below is the complete testing process and script.
 
 \subsection{Core Principle}
 
 Three key changes force Protenix-v2 to pure PyTorch implementation:
 
 \begin{enumerate}
-    \item \texttt{LAYERNORM\\_TYPE=openfold}: bypass CUDA LayerNorm extension;
-    \item \texttt{triangle\_multiplicative = "torch"}: use PyTorch native triangle multiplication;
-    \item \texttt{triangle\_attention = "torch"}: use PyTorch native triangle attention;
-    \item \texttt{device = "cpu"}: run entirely on CPU.
+    \item LAYERNORM_TYPE=openfold: bypass CUDA LayerNorm extension
+    \item triangle_multiplicative = "torch": use PyTorch native triangle multiplication
+    \item triangle_attention = "torch": use PyTorch native triangle attention
+    \item device = "cpu": run entirely on CPU
 \end{enumerate}
 
 \subsection{Complete Test Script}
 
-See \texttt{/root/Protenix/run\_forward\_cpu.py} for the full script. The key structure:
+See /root/Protenix/run_forward_cpu.py for the full script. The key structure:
 
 \begin{enumerate}
-    \item Set environment variables before any import: \texttt{LAYERNORM\\_TYPE=openfold}, \texttt{MLU\\_VISIBLE\\_DEVICES=""}
-    \item Apply ESM patch via \texttt{sys.modules["esm"] = \_FakeEsm()}
-    \item Merge configurations and override \texttt{triangle\_*="torch"}
-    \item Load model to CPU with \texttt{Protenix(configs).to("cpu")}
-    \item Load checkpoint with \texttt{torch.load(map\_location="cpu")}
-    \item Generate real input features via \texttt{get\_inference\_dataloader(configs)}
-    \item Run forward: \texttt{model(input\_feature\_dict=feat, mode="inference")}
+    \item Set environment variables before any import: LAYERNORM_TYPE=openfold, MLU_VISIBLE_DEVICES=""
+    \item Apply ESM patch via sys.modules["esm"] = _FakeEsm()
+    \item Merge configurations and override triangle_*="torch"
+    \item Load model to CPU with Protenix(configs).to("cpu")
+    \item Load checkpoint with torch.load(map_location="cpu")
+    \item Generate real input features via get_inference_dataloader(configs)
+    \item Run forward: model(input_feature_dict=feat, mode="inference")
 \end{enumerate}
 
-See the actual script at \texttt{/root/Protenix/run\_forward\_cpu.py} for the complete code.
+See the actual script at /root/Protenix/run_forward_cpu.py for the complete code.
 
 \clearpage
 
@@ -690,16 +840,15 @@ inference scheduler 16.0
 [Protenix init] msa_module done at 21:53:37
 [Protenix init] constraint_embedder done at 21:53:37
 [Protenix init] pairformer_stack done at 21:56:49  <- slowest (JIT)
-Diffusion Module has 16.0
 [Protenix init] diffusion_module done at 21:59:29
 [Protenix init] distogram_head done at 21:59:29
 [Protenix init] confidence_head done at 21:59:45
 [2] Model ready, params: 464,442,431
 [3] Generating features (official json_to_feature)...
-[4] Features ready: msa=torch.Size([1, 8, 512]), N_token=8
+[4] Features ready: msa=torch.Size([1, 8, 512]), N_token=***
 [5] Running forward...
 [Protenix init] pairformer_stack done at 21:56:49  <- JIT compilation slowest
-✅ Forward PASSED!
+Forward PASSED!
   positions  : torch.Size([1, 8, 44, 3])
   plDDT      : torch.Size([1, 8, 44])
   mean_plddt: <computed value>
@@ -709,12 +858,12 @@ Diffusion Module has 16.0
 \subsection{CPU Initialization Timing Breakdown}
 
 \begin{longtable}{lcc}
-    \caption{CPU model initialization timing breakdown} \\
+    \caption{CPU Model Initialization Timing Breakdown} \\
     \toprule
     \textbf{Module} & \textbf{Time} & \textbf{Notes} \\
     \midrule
     \endfirsthead
-    \caption[]{CPU timing (continued)} \\
+    \caption[]{CPU Timing (cont.)} \\
     \toprule
     \textbf{Module} & \textbf{Time} & \textbf{Notes} \\
     \midrule
@@ -723,33 +872,33 @@ Diffusion Module has 16.0
     \endfoot
     \endlastfoot
 
-    input_embedder & $\sim$1s & \\
-    relative_position_encoding & $\sim$1s & \\
-    template_embedder & $\sim$8s & \\
-    msa_module & $\sim$8s & \\
-    constraint_embedder & $\sim$1s & \\
-    pairformer_stack & $\sim$3min12s & JIT compilation \\
-    diffusion_module & $\sim$2min40s & JIT compilation \\
-    distogram_head & $\sim$1s & \\
-    confidence_head & $\sim$15s & JIT compilation \\
+    input_embedder & ~1s & \\
+    relative_position_encoding & ~1s & \\
+    template_embedder & ~8s & \\
+    msa_module & ~8s & \\
+    constraint_embedder & ~1s & \\
+    pairformer_stack & ~3min12s & JIT compilation \\
+    diffusion_module & ~2min40s & JIT compilation \\
+    distogram_head & ~1s & \\
+    confidence_head & ~15s & JIT compilation \\
     \midrule
-    \textbf{Total initialization} & $\sim$6min30s & \\
-    \textbf{Single forward step (8AA)} & $\sim$30-60s & CPU, first run \\
+    \textbf{Total initialization} & ~6min30s & \\
+    \textbf{Single forward step (8AA)} & ~30-60s & CPU, first run \\
 \end{longtable}
 
 \clearpage
 
 \section{MLU Inference Status Summary}
 
-\subsection{MLU Compatibility of Each Component}
+\subsection{MLU Component Compatibility Status}
 
 \begin{longtable}{lccc}
-    \caption{Protenix-v2 component MLU compatibility status} \\
+    \caption{Protenix-v2 Component MLU Compatibility Status} \\
     \toprule
     \textbf{Component} & \textbf{MLU Status} & \textbf{Dependency} & \textbf{Notes} \\
     \midrule
     \endfirsthead
-    \caption[]{Component status (continued)} \\
+    \caption[]{Component status (cont.)} \\
     \toprule
     \textbf{Component} & \textbf{MLU Status} & \textbf{Dependency} & \textbf{Notes} \\
     \midrule
@@ -758,17 +907,17 @@ Diffusion Module has 16.0
     \endfoot
     \endlastfoot
 
-    Model framework init & \checkmark & torch.mlu & All modules JIT compile successfully \\
-    Checkpoint loading & \checkmark & torch.mlu & 464.44M params map normally \\
-    LayerNorm & \checkmark & LAYERNORM_TYPE=openfold & PyTorch native \\
-    ESM import & \checkmark & sys.modules patch & Conflict bypassed \\
-    Config parsing & \checkmark & ml_collections & get_base_config works \\
-    Data featurization & \checkmark & torch.mlu & 8AA parsed successfully \\
-    cuequivariance_torch & \checkmark & Pure PyTorch & No CUDA dependency \\
-    \textbf{triangle\_multiplicative} & \textbf{BLOCKER} & \textbf{cuequivariance\_ops\_torch} & \textbf{CUDA-only, pending port} \\
-    \textbf{triangle\_attention} & \textbf{BLOCKER} & \textbf{cuequivariance\_ops\_torch} & \textbf{CUDA-only, pending port} \\
-    \textbf{attention\_pair\_bias} & \textbf{BLOCKER} & \textbf{cuequivariance\_ops\_torch} & \textbf{Required by diffusion, pending port} \\
-    CCD .cif files & \checkmark & 469MB downloaded & /root/.cache/protenix/ \\
+    Model framework init & OK & torch.mlu & All modules JIT compile successfully \\
+    Checkpoint loading & OK & torch.mlu & 464.44M params map normally \\
+    LayerNorm & OK & LAYERNORM_TYPE=openfold & PyTorch native \\
+    ESM import & OK & sys.modules patch & Conflict bypassed \\
+    Config parsing & OK & ml_collections & get_base_config works \\
+    Data featurization & OK & torch.mlu & 8AA parsed successfully \\
+    cuequivariance\_torch & OK & Pure PyTorch & No CUDA dependency \\
+    triangle\_multiplicative & \textbf{BLOCKER} & cuequivariance\_ops\_torch & \textbf{CUDA-only, pending port} \\
+    triangle\_attention & \textbf{BLOCKER} & cuequivariance\_ops\_torch & \textbf{CUDA-only, pending port} \\
+    attention\_pair\_bias & \textbf{BLOCKER} & cuequivariance\_ops\_torch & \textbf{Required by diffusion, pending port} \\
+    CCD .cif files & OK & 469MB downloaded & /root/.cache/protenix/ \\
 \end{longtable}
 
 \subsection{Core Blocker Details}
@@ -789,9 +938,9 @@ from cuequivariance_ops_torch import triangle_attention
 
 This package is developed by NVIDIA and provides CUDA/Triton fused operators for acceleration. Current status:
 \begin{itemize}
-    \item \textbf{Published}: CUDA 12.x version (pip installable)
-    \item \textbf{Not published}: MLU/CANN version (requires Huawei or NVIDIA porting)
-    \item \textbf{Pure PyTorch fallback}: \texttt{triangle\_multiplicative="torch"} works but $\sim$10x slower
+    \item Published: CUDA 12.x version (pip installable)
+    \item Not published: MLU/CANN version (requires Cambricon or NVIDIA porting)
+    \item Pure PyTorch fallback: triangle_multiplicative="torch" works but ~10x slower
 \end{itemize}
 
 \clearpage
@@ -801,20 +950,20 @@ This package is developed by NVIDIA and provides CUDA/Triton fused operators for
 \subsection{Test Conclusions}
 
 \begin{enumerate}
-    \item \textbf{Protenix-v2 code and checkpoint fully match}: 464,442,431 parameters consistent between checkpoint and model;
-    \item \textbf{MLU370 initialization fully normal}: all modules (JIT compilation) succeeded;
-    \item \textbf{MLU forward blocked}: \texttt{cuequivariance\_ops\_torch} is the sole blocker, awaiting NVIDIA/Huawei porting;
-    \item \textbf{CPU solution verified feasible}: forcing \texttt{triangle\_*="torch"} completes forward test; full inference (200 diffusion steps) takes several hours on CPU;
-    \item \textbf{v2 updates are valuable}: antibody-antigen prediction improvement is significant; recommended to use MLU/GPU when conditions permit.
+    \item Protenix-v2 code and checkpoint fully match: 464,442,431 parameters consistent between checkpoint and model
+    \item MLU370 initialization fully normal: all modules (JIT compilation) succeeded
+    \item MLU forward blocked: cuequivariance_ops_torch is the sole blocker, awaiting NVIDIA/Cambricon porting
+    \item CPU solution verified feasible: forcing triangle_*="torch" completes forward test; full inference (200 diffusion steps) takes hours on CPU
+    \item v2 updates are valuable: antibody-antigen prediction improvement significant; recommended to use MLU/GPU when conditions permit
 \end{enumerate}
 
 \subsection{Next Steps}
 
 \begin{enumerate}
-    \item Wait for \texttt{cuequivariance\_ops\_torch} MLU/CANN support (file issue with Huawei CANN team or NVIDIA);
-    \item Manually port \texttt{cuequivariance\_ops\_torch} operators to MLU (requires familiarity with Triton + CNNL);
-    \item Consider switching to other models with existing MLU support (e.g., RoseTTAFold2NA, HelixFold3);
-    \item For quick verification, use CPU mode (\texttt{triangle\_*="torch"}) for functional testing.
+    \item Wait for cuequivariance_ops_torch MLU/CANN support (file issue with Cambricon CANN team or NVIDIA)
+    \item Manually port cuequivariance_ops_torch operators to MLU (requires familiarity with Triton + CNNL)
+    \item Consider switching to other models with existing MLU support (e.g., RoseTTAFold2NA, HelixFold3)
+    \item For quick verification, use CPU mode (triangle_*="torch") for functional testing
 \end{enumerate}
 
 \appendix
@@ -830,7 +979,7 @@ python3 run_forward.py
 cd /root/Protenix
 # Key: triangle_*="torch" + LAYERNORM_TYPE=openfold
 python3 run_forward_cpu.py
-# Expected: ✅ Forward PASSED! positions, plDDT, mean_plddt, timing
+# Expected: Forward PASSED! positions, plDDT, mean_plddt, timing
 \end{minted}
 
 \begin{minted}[caption={Full inference (requires MLU/GPU + smaller N_step)}]{python}
@@ -842,7 +991,7 @@ python3 run_inference.py
 
 \vfill
 \begin{center}
-    \textbf{Document version: v1.0} \quad \textbf{Updated: 2026-04-08} \\
+    \textbf{Document version: v1.1} \quad \textbf{Updated: 2026-04-08} \\
     \texttt{https://github.com/bytedance/Protenix}
 \end{center}
 
